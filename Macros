@@ -1,0 +1,1182 @@
+# -*- coding: utf-8 -*-
+"""GPO Macro — PyQt5 Neon Glass Edition"""
+
+import sys
+import os
+import json
+import time
+import random
+import threading
+from pathlib import Path
+
+from PyQt5.QtCore import Qt, QObject, pyqtSignal, QTimer
+from PyQt5.QtGui import QPixmap, QPainter, QColor
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
+    QLineEdit, QListWidget, QListWidgetItem, QCheckBox, QDoubleSpinBox,
+    QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QFileDialog,
+    QTextEdit, QScrollArea, QSizePolicy, QAbstractItemView
+)
+
+from pynput import keyboard, mouse
+from pynput.keyboard import Key, Controller as KBController
+from pynput.mouse import Button, Controller as MController
+
+# ---------------- Пути ----------------
+BASE_DIR = Path(__file__).parent
+MACROS_DIR = BASE_DIR / "macros"
+MACROS_DIR.mkdir(exist_ok=True)
+SETTINGS_FILE = BASE_DIR / "settings.json"
+
+# ---------------- Палитра ----------------
+BG_DARK      = "#05070d"
+NEON_BLUE    = "#00d4ff"
+NEON_BLUE_D  = "#0099cc"
+TEXT         = "#e6f1ff"
+TEXT_DIM     = "#7a8699"
+RED          = "#ff4d6d"
+GREEN        = "#00ff9d"
+YELLOW       = "#ffcc44"
+
+# прозрачность панелей (0-255 в rgba)
+PANEL_A     = 175   # ~0.68
+PANEL_A_2   = 165   # ~0.65
+PANEL_A_3   = 200   # ~0.78 (для логов, чтобы текст читался)
+
+DEFAULT_SETTINGS = {
+    "hotkey_record": "f9",
+    "hotkey_play": "f10",
+    "hotkey_stop": "f8",
+    "random_delay_enabled": False,
+    "random_delay_min": 0.5,
+    "random_delay_max": 1.5,
+    "record_mouse": False,
+    "playback_mouse": True,
+    "background_image": "",
+    "background_dim": 60,     # затемнение фона (0–255)
+}
+
+
+def load_settings():
+    if SETTINGS_FILE.exists():
+        try:
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            s = DEFAULT_SETTINGS.copy()
+            s.update(data)
+            return s
+        except Exception:
+            pass
+    return DEFAULT_SETTINGS.copy()
+
+
+def save_settings(s):
+    try:
+        SETTINGS_FILE.write_text(
+            json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def key_to_str(key):
+    if isinstance(key, Key):
+        return key.name
+    if isinstance(key, keyboard.KeyCode):
+        if key.char:
+            return f"char:{key.char}"
+        if key.vk is not None:
+            return f"vk:{key.vk}"
+    return str(key)
+
+
+def str_to_key(s):
+    if s.startswith("char:"):
+        return s[5:]
+    if s.startswith("vk:"):
+        return keyboard.KeyCode.from_vk(int(s[3:]))
+    try:
+        return getattr(Key, s)
+    except AttributeError:
+        return s
+
+
+# ---------------- QSS ----------------
+QSS = f"""
+QWidget {{
+    color: {TEXT};
+    font-family: 'Segoe UI', sans-serif;
+    font-size: 12px;
+}}
+
+QFrame#Panel {{
+    background-color: rgba(10, 18, 34, {PANEL_A});
+    border: 2px solid {NEON_BLUE};
+    border-radius: 16px;
+}}
+
+QFrame#InnerPanel {{
+    background-color: rgba(18, 28, 48, {PANEL_A_2});
+    border: 1px solid rgba(0, 212, 255, 70);
+    border-radius: 12px;
+}}
+
+QFrame#LogPanel {{
+    background-color: rgba(6, 10, 20, {PANEL_A_3});
+    border: 1px solid rgba(0, 212, 255, 50);
+    border-radius: 12px;
+}}
+
+QLabel {{ background: transparent; }}
+
+QLabel#Title {{
+    color: {NEON_BLUE};
+    font-size: 22px;
+    font-weight: bold;
+    letter-spacing: 3px;
+}}
+QLabel#SectionTitle {{
+    color: {NEON_BLUE};
+    font-size: 13px;
+    font-weight: bold;
+    letter-spacing: 1px;
+}}
+QLabel#Dim {{ color: {TEXT_DIM}; font-size: 11px; }}
+QLabel#Good {{ color: {GREEN}; font-weight: bold; font-size: 13px; }}
+QLabel#Bad  {{ color: {RED}; font-weight: bold; font-size: 13px; }}
+QLabel#Info {{ color: {NEON_BLUE}; font-weight: bold; font-size: 13px; }}
+
+QPushButton {{
+    background-color: rgba(0, 153, 204, 220);
+    color: #000000;
+    border: none;
+    border-radius: 10px;
+    padding: 8px 14px;
+    font-weight: bold;
+    font-size: 12px;
+}}
+QPushButton:hover  {{ background-color: {NEON_BLUE}; }}
+QPushButton:pressed {{ background-color: {NEON_BLUE_D}; }}
+QPushButton:disabled {{ background-color: rgba(60, 70, 90, 150); color: #666; }}
+
+QPushButton#Primary {{
+    font-size: 15px;
+    padding: 14px;
+    border-radius: 12px;
+    background-color: rgba(0, 153, 204, 230);
+}}
+QPushButton#Primary:hover {{ background-color: {NEON_BLUE}; }}
+QPushButton#PrimaryRec {{
+    font-size: 15px;
+    padding: 14px;
+    border-radius: 12px;
+    background-color: rgba(255, 77, 109, 230);
+    color: #ffffff;
+}}
+QPushButton#PrimaryRec:hover {{ background-color: {RED}; }}
+
+QPushButton#Danger {{
+    background-color: rgba(255, 77, 109, 40);
+    color: {RED};
+    border: 2px solid {RED};
+    border-radius: 10px;
+    padding: 6px 12px;
+}}
+QPushButton#Danger:hover {{ background-color: rgba(255, 77, 109, 100); }}
+
+QPushButton#Ghost {{
+    background-color: transparent;
+    color: {NEON_BLUE};
+    border: 2px solid {NEON_BLUE};
+    border-radius: 10px;
+    padding: 6px 12px;
+}}
+QPushButton#Ghost:hover {{ background-color: rgba(0, 212, 255, 40); }}
+QPushButton#Ghost[capturing="true"] {{
+    color: {YELLOW};
+    border-color: {YELLOW};
+}}
+
+QLineEdit, QDoubleSpinBox, QSpinBox {{
+    background-color: rgba(8, 14, 28, 200);
+    color: {TEXT};
+    border: 1px solid {NEON_BLUE};
+    border-radius: 8px;
+    padding: 6px 10px;
+    selection-background-color: {NEON_BLUE_D};
+}}
+QLineEdit:focus, QDoubleSpinBox:focus {{ border: 2px solid {NEON_BLUE}; }}
+
+QListWidget {{
+    background-color: rgba(8, 14, 28, 180);
+    border: 1px solid rgba(0, 212, 255, 60);
+    border-radius: 10px;
+    padding: 4px;
+    outline: none;
+    font-size: 12px;
+}}
+QListWidget::item {{
+    padding: 8px 10px;
+    border-radius: 8px;
+    margin: 2px 0;
+}}
+QListWidget::item:hover {{ background-color: rgba(0, 212, 255, 40); }}
+QListWidget::item:selected {{
+    background-color: rgba(0, 153, 204, 220);
+    color: #000000;
+}}
+
+QCheckBox {{ spacing: 10px; color: {TEXT}; font-size: 12px; }}
+QCheckBox::indicator {{
+    width: 18px; height: 18px;
+    border: 2px solid {NEON_BLUE};
+    border-radius: 4px;
+    background-color: rgba(8, 14, 28, 200);
+}}
+QCheckBox::indicator:checked {{
+    background-color: {NEON_BLUE};
+}}
+
+QTextEdit {{
+    background: transparent;
+    border: none;
+    color: {TEXT_DIM};
+    font-family: 'Consolas', monospace;
+    font-size: 11px;
+    padding: 4px;
+}}
+
+QScrollBar:vertical {{
+    background: transparent; width: 8px; margin: 4px;
+}}
+QScrollBar::handle:vertical {{
+    background: {NEON_BLUE_D};
+    border-radius: 4px;
+    min-height: 20px;
+}}
+QScrollBar::handle:vertical:hover {{ background: {NEON_BLUE}; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
+
+QDialog {{ background-color: {BG_DARK}; }}
+
+QScrollArea {{ background: transparent; border: none; }}
+QScrollArea > QWidget > QWidget {{ background: transparent; }}
+"""
+
+
+# ---------------- Сигналы (для обновления UI из потоков) ----------------
+class AppSignals(QObject):
+    log = pyqtSignal(str)
+    status = pyqtSignal(str, str)          # текст, цвет
+    playback_done = pyqtSignal()
+    recording_done = pyqtSignal()
+
+
+# ---------------- Виджет с фоновой картинкой ----------------
+class BackgroundWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.pixmap = None
+        self.dim_alpha = 60
+
+    def set_background(self, path, dim_alpha=60):
+        self.dim_alpha = dim_alpha
+        if path and os.path.exists(path):
+            self.pixmap = QPixmap(path)
+            if self.pixmap.isNull():
+                self.pixmap = None
+        else:
+            self.pixmap = None
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        if self.pixmap is not None:
+            # cover-режим
+            scaled = self.pixmap.scaled(
+                self.size(), Qt.KeepAspectRatioByExpanding,
+                Qt.SmoothTransformation)
+            x = (self.width() - scaled.width()) // 2
+            y = (self.height() - scaled.height()) // 2
+            p.drawPixmap(x, y, scaled)
+            p.fillRect(self.rect(), QColor(0, 0, 0, self.dim_alpha))
+        else:
+            p.fillRect(self.rect(), QColor(BG_DARK))
+
+
+# ---------------- Неоновый диалог ввода ----------------
+class NeonInputDialog(QDialog):
+    def __init__(self, parent, title, prompt, initial=""):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setFixedSize(440, 190)
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(22, 22, 22, 18)
+        v.setSpacing(14)
+
+        lbl = QLabel(prompt)
+        lbl.setObjectName("SectionTitle")
+        v.addWidget(lbl)
+
+        self.entry = QLineEdit(initial)
+        self.entry.selectAll()
+        v.addWidget(self.entry)
+
+        row = QHBoxLayout()
+        row.addStretch()
+
+        cancel = QPushButton("Отмена")
+        cancel.setObjectName("Ghost")
+        cancel.clicked.connect(self.reject)
+        row.addWidget(cancel)
+
+        ok = QPushButton("OK")
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        row.addWidget(ok)
+
+        v.addLayout(row)
+
+        self.entry.setFocus()
+        self.entry.returnPressed.connect(self.accept)
+
+    def get_value(self):
+        return self.entry.text().strip()
+
+
+# ---------------- Диалог настроек ----------------
+class SettingsDialog(QDialog):
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.settings = app.settings
+        self._capture_listener = None
+
+        self.setWindowTitle("Настройки")
+        self.setModal(True)
+        self.setFixedSize(640, 800)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(12)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        cv = QVBoxLayout(content)
+        cv.setContentsMargins(4, 4, 4, 4)
+        cv.setSpacing(14)
+
+        self._build_hotkeys(cv)
+        self._build_delays(cv)
+        self._build_mouse(cv)
+        self._build_bg(cv)
+        cv.addStretch()
+
+        scroll.setWidget(content)
+        root.addWidget(scroll, 1)
+
+        close_btn = QPushButton("ЗАКРЫТЬ")
+        close_btn.setObjectName("Primary")
+        close_btn.clicked.connect(self._close)
+        root.addWidget(close_btn)
+
+    def _close(self):
+        save_settings(self.settings)
+        self.app.refresh_header_hint()
+        self.accept()
+
+    def _section(self, parent, title):
+        frame = QFrame()
+        frame.setObjectName("Panel")
+        v = QVBoxLayout(frame)
+        v.setContentsMargins(18, 16, 18, 16)
+        v.setSpacing(10)
+
+        t = QLabel(title)
+        t.setObjectName("SectionTitle")
+        v.addWidget(t)
+
+        parent.addWidget(frame)
+        return frame, v
+
+    # ----- горячие клавиши -----
+    def _build_hotkeys(self, parent):
+        frame, v = self._section(parent, "⌨  ГОРЯЧИЕ КЛАВИШИ")
+        self._hotkey_row(v, "Начать запись", "hotkey_record")
+        self._hotkey_row(v, "Воспроизвести последний", "hotkey_play")
+        self._hotkey_row(v, "СТОП", "hotkey_stop")
+
+    def _hotkey_row(self, parent, label, key_name):
+        row = QHBoxLayout()
+        row.setSpacing(10)
+
+        lbl = QLabel(label)
+        row.addWidget(lbl, 1)
+
+        btn = QPushButton(self.settings.get(key_name, "").upper())
+        btn.setObjectName("Ghost")
+        btn.setFixedWidth(180)
+        btn.setFixedHeight(34)
+        btn.clicked.connect(lambda: self._start_capture(key_name, btn))
+        row.addWidget(btn)
+
+        parent.addLayout(row)
+
+    def _start_capture(self, key_name, button):
+        if self._capture_listener is not None:
+            return
+        self.app.capturing = True
+        button.setText("Нажми клавишу...")
+        button.setProperty("capturing", True)
+        button.style().unpolish(button)
+        button.style().polish(button)
+
+        def on_press(key):
+            ks = key_to_str(key)
+            self.settings[key_name] = ks
+            save_settings(self.settings)
+            self.app.capturing = False
+            self._capture_listener = None
+            QTimer.singleShot(0, lambda: self._finish_capture(button, ks))
+            return False
+
+        listener = keyboard.Listener(on_press=on_press)
+        listener.daemon = True
+        listener.start()
+        self._capture_listener = listener
+
+    def _finish_capture(self, button, ks):
+        button.setText(ks.upper())
+        button.setProperty("capturing", False)
+        button.style().unpolish(button)
+        button.style().polish(button)
+        self.app.refresh_header_hint()
+
+    # ----- задержки -----
+    def _build_delays(self, parent):
+        frame, v = self._section(parent, "⏱  ЗАДЕРЖКИ")
+
+        self.random_chk = QCheckBox(
+            "Рандомная задержка (добавляется к каждому действию)")
+        self.random_chk.setChecked(
+            self.settings.get("random_delay_enabled", False))
+        self.random_chk.stateChanged.connect(self._save_delays)
+        v.addWidget(self.random_chk)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(QLabel("От:"))
+
+        self.min_spin = QDoubleSpinBox()
+        self.min_spin.setRange(0.0, 60.0)
+        self.min_spin.setSingleStep(0.1)
+        self.min_spin.setDecimals(2)
+        self.min_spin.setValue(float(self.settings.get("random_delay_min", 0.5)))
+        self.min_spin.setFixedWidth(90)
+        self.min_spin.valueChanged.connect(self._save_delays)
+        row.addWidget(self.min_spin)
+
+        row.addSpacing(16)
+        row.addWidget(QLabel("до:"))
+
+        self.max_spin = QDoubleSpinBox()
+        self.max_spin.setRange(0.0, 60.0)
+        self.max_spin.setSingleStep(0.1)
+        self.max_spin.setDecimals(2)
+        self.max_spin.setValue(float(self.settings.get("random_delay_max", 1.5)))
+        self.max_spin.setFixedWidth(90)
+        self.max_spin.valueChanged.connect(self._save_delays)
+        row.addWidget(self.max_spin)
+
+        row.addWidget(QLabel("сек"))
+        row.addStretch()
+        v.addLayout(row)
+
+    def _save_delays(self):
+        self.settings["random_delay_enabled"] = self.random_chk.isChecked()
+        self.settings["random_delay_min"] = self.min_spin.value()
+        self.settings["random_delay_max"] = self.max_spin.value()
+        save_settings(self.settings)
+
+    # ----- мышь -----
+    def _build_mouse(self, parent):
+        frame, v = self._section(parent, "🖱  МЫШЬ")
+
+        self.rec_mouse = QCheckBox("Записывать движения и клики мыши")
+        self.rec_mouse.setChecked(self.settings.get("record_mouse", False))
+        self.rec_mouse.stateChanged.connect(self._save_mouse)
+        v.addWidget(self.rec_mouse)
+
+        self.play_mouse = QCheckBox("Воспроизводить события мыши")
+        self.play_mouse.setChecked(self.settings.get("playback_mouse", True))
+        self.play_mouse.stateChanged.connect(self._save_mouse)
+        v.addWidget(self.play_mouse)
+
+    def _save_mouse(self):
+        self.settings["record_mouse"] = self.rec_mouse.isChecked()
+        self.settings["playback_mouse"] = self.play_mouse.isChecked()
+        save_settings(self.settings)
+
+    # ----- фон -----
+    def _build_bg(self, parent):
+        frame, v = self._section(parent, "🖼  ФОН ПРИЛОЖЕНИЯ")
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+
+        self.bg_entry = QLineEdit(self.settings.get("background_image", ""))
+        self.bg_entry.setReadOnly(True)
+        row.addWidget(self.bg_entry, 1)
+
+        pick = QPushButton("Обзор")
+        pick.setFixedWidth(90)
+        pick.clicked.connect(self._pick_bg)
+        row.addWidget(pick)
+
+        reset = QPushButton("Сброс")
+        reset.setObjectName("Danger")
+        reset.setFixedWidth(80)
+        reset.clicked.connect(self._reset_bg)
+        row.addWidget(reset)
+
+        v.addLayout(row)
+
+        # яркость фона
+        dim_row = QHBoxLayout()
+        dim_row.addWidget(QLabel("Затемнение фона:"))
+        self.dim_spin = QDoubleSpinBox()
+        self.dim_spin.setRange(0, 200)
+        self.dim_spin.setSingleStep(10)
+        self.dim_spin.setDecimals(0)
+        self.dim_spin.setValue(self.settings.get("background_dim", 60))
+        self.dim_spin.setFixedWidth(90)
+        self.dim_spin.valueChanged.connect(self._save_dim)
+        dim_row.addWidget(self.dim_spin)
+        dim_row.addWidget(QLabel("(0 = ярко, 200 = темно)"))
+        dim_row.addStretch()
+        v.addLayout(dim_row)
+
+        hint = QLabel(
+            "Панели полупрозрачные — через них видно картинку. "
+            "Прозрачность меняется константами PANEL_A, PANEL_A_2, PANEL_A_3 в файле.")
+        hint.setObjectName("Dim")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+
+    def _pick_bg(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выбери картинку для фона", "",
+            "Изображения (*.png *.jpg *.jpeg *.bmp *.gif *.webp);;Все файлы (*.*)")
+        if path:
+            self.bg_entry.setText(path)
+            self.settings["background_image"] = path
+            save_settings(self.settings)
+            self.app.apply_background()
+
+    def _reset_bg(self):
+        self.bg_entry.setText("")
+        self.settings["background_image"] = ""
+        save_settings(self.settings)
+        self.app.apply_background()
+
+    def _save_dim(self):
+        self.settings["background_dim"] = int(self.dim_spin.value())
+        save_settings(self.settings)
+        self.app.apply_background()
+
+
+# ---------------- Главное приложение ----------------
+class MacroApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.settings = load_settings()
+
+        self.setWindowTitle("GPO Macro")
+        self.resize(960, 640)
+        #self.resize(1160, 760)
+        self.setMinimumSize(960, 640)
+
+        # ---- state ----
+        self.recording = False
+        self.playing = False
+        self.stop_flag = False
+        self.record_events = []
+        self.record_start = 0.0
+        self.capturing = False
+        self.current_macro = None
+        self.playback_thread = None
+
+        # ---- сигналы ----
+        self.signals = AppSignals()
+        self.signals.log.connect(self._append_log)
+        self.signals.status.connect(self._set_status)
+        self.signals.playback_done.connect(self._on_playback_finished)
+
+        # ---- фон ----
+        self.bg = BackgroundWidget()
+        self.setCentralWidget(self.bg)
+
+        # ---- хуки ----
+        self.kb_listener = keyboard.Listener(
+            on_press=self._on_key_press, on_release=self._on_key_release)
+        self.ms_listener = mouse.Listener(
+            on_click=self._on_click, on_move=self._on_move)
+        self.kb_listener.daemon = True
+        self.ms_listener.daemon = True
+        self.kb_listener.start()
+        self.ms_listener.start()
+
+        self._build_ui()
+        self.refresh_macro_list()
+        self.apply_background()
+
+    # ==================== UI ====================
+    def _build_ui(self):
+        root = QVBoxLayout(self.bg)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(14)
+
+        # ---------- header ----------
+        header = QFrame()
+        header.setObjectName("Panel")
+        hh = QHBoxLayout(header)
+        hh.setContentsMargins(22, 12, 22, 12)
+        hh.setSpacing(16)
+
+        title = QLabel("⚡ GPO MACRO")
+        title.setObjectName("Title")
+        hh.addWidget(title)
+
+        self.header_hint = QLabel("")
+        self.header_hint.setObjectName("Dim")
+        hh.addWidget(self.header_hint, 1)
+
+        settings_btn = QPushButton("⚙  Настройки")
+        settings_btn.setObjectName("Ghost")
+        settings_btn.setFixedHeight(38)
+        settings_btn.setFixedWidth(160)
+        settings_btn.clicked.connect(self.open_settings)
+        hh.addWidget(settings_btn)
+
+        root.addWidget(header)
+        self.refresh_header_hint()
+
+        # ---------- body ----------
+        body = QHBoxLayout()
+        body.setSpacing(14)
+
+        # ===== левая колонка: макросы =====
+        left = QFrame()
+        left.setObjectName("Panel")
+        left.setFixedWidth(320)
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(20, 18, 20, 18)
+        lv.setSpacing(10)
+
+        ltitle = QLabel("📁  МАКРОСЫ")
+        ltitle.setObjectName("SectionTitle")
+        lv.addWidget(ltitle)
+
+        lhint = QLabel("Выбери из списка для воспроизведения")
+        lhint.setObjectName("Dim")
+        lv.addWidget(lhint)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.list_widget.itemSelectionChanged.connect(self._on_macro_select)
+        lv.addWidget(self.list_widget, 1)
+
+        brow = QHBoxLayout()
+        brow.setSpacing(8)
+
+        del_btn = QPushButton("🗑  Удалить")
+        del_btn.setObjectName("Danger")
+        del_btn.clicked.connect(self.delete_macro)
+        brow.addWidget(del_btn)
+
+        ren_btn = QPushButton("✎  Имя")
+        ren_btn.setObjectName("Ghost")
+        ren_btn.clicked.connect(self.rename_macro)
+        brow.addWidget(ren_btn)
+
+        lv.addLayout(brow)
+        body.addWidget(left, 0)
+
+        # ===== правая колонка =====
+        right = QFrame()
+        right.setObjectName("Panel")
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(20, 18, 20, 18)
+        rv.setSpacing(14)
+
+        rtitle = QLabel("🎮  УПРАВЛЕНИЕ")
+        rtitle.setObjectName("SectionTitle")
+        rv.addWidget(rtitle)
+
+        # кнопки записи/воспроизведения
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+
+        self.rec_btn = QPushButton("⏺  ЗАПИСЬ")
+        self.rec_btn.setObjectName("Primary")
+        self.rec_btn.setFixedHeight(62)
+        self.rec_btn.clicked.connect(self.toggle_recording)
+        btn_row.addWidget(self.rec_btn, 1)
+
+        self.play_btn = QPushButton("▶  ВОСПРОИЗВЕСТИ")
+        self.play_btn.setObjectName("Primary")
+        self.play_btn.setFixedHeight(62)
+        self.play_btn.clicked.connect(self.toggle_playback)
+        btn_row.addWidget(self.play_btn, 1)
+
+        rv.addLayout(btn_row)
+
+        # опции
+        opts = QFrame()
+        opts.setObjectName("InnerPanel")
+        oh = QHBoxLayout(opts)
+        oh.setContentsMargins(18, 12, 18, 12)
+        oh.setSpacing(12)
+
+        oh.addWidget(QLabel("Скорость:"))
+        self.speed_edit = QLineEdit("1.0")
+        self.speed_edit.setFixedWidth(80)
+        oh.addWidget(self.speed_edit)
+
+        oh.addSpacing(20)
+        oh.addWidget(QLabel("Повторов:"))
+        self.loops_edit = QLineEdit("1")
+        self.loops_edit.setFixedWidth(80)
+        oh.addWidget(self.loops_edit)
+
+        oh.addWidget(QLabel("(0 = ∞)"))
+        oh.addStretch()
+        rv.addWidget(opts)
+
+        # статус + лог
+        status_panel = QFrame()
+        status_panel.setObjectName("InnerPanel")
+        sp = QVBoxLayout(status_panel)
+        sp.setContentsMargins(16, 12, 16, 16)
+        sp.setSpacing(8)
+
+        self.status_lbl = QLabel("●  ГОТОВ")
+        self.status_lbl.setObjectName("Good")
+        sp.addWidget(self.status_lbl)
+
+        log_panel = QFrame()
+        log_panel.setObjectName("LogPanel")
+        lp = QVBoxLayout(log_panel)
+        lp.setContentsMargins(8, 8, 8, 8)
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        lp.addWidget(self.log_box)
+
+        sp.addWidget(log_panel, 1)
+        rv.addWidget(status_panel, 1)
+
+        body.addWidget(right, 1)
+        root.addLayout(body, 1)
+
+    def refresh_header_hint(self):
+        try:
+            hr = (self.settings.get("hotkey_record") or "").upper()
+            hp = (self.settings.get("hotkey_play") or "").upper()
+            hs = (self.settings.get("hotkey_stop") or "").upper()
+            self.header_hint.setText(
+                f"{hr} — запись   |   {hp} — повтор   |   {hs} — стоп   "
+                f"(меняется в настройках)")
+        except Exception:
+            pass
+
+    # ==================== ФОН ====================
+    def apply_background(self):
+        path = self.settings.get("background_image", "")
+        dim = int(self.settings.get("background_dim", 60))
+        self.bg.set_background(path, dim)
+
+    # ==================== ЛОГИ ====================
+    def _append_log(self, msg):
+        try:
+            ts = time.strftime("%H:%M:%S")
+            self.log_box.append(f"[{ts}] {msg}")
+        except Exception:
+            pass
+
+    def _set_status(self, text, color):
+        try:
+            self.status_lbl.setText(f"●  {text}")
+            self.status_lbl.setStyleSheet(
+                f"color: {color}; font-weight: bold; font-size: 13px;")
+        except Exception:
+            pass
+
+    def log(self, msg):
+        # вызывается из UI-потока
+        self._append_log(msg)
+
+    def set_status(self, text, color):
+        self._set_status(text, color)
+
+    # ==================== СПИСОК МАКРОСОВ ====================
+    def refresh_macro_list(self):
+        self.list_widget.clear()
+        files = sorted(MACROS_DIR.glob("*.json"))
+        for f in files:
+            self.list_widget.addItem(QListWidgetItem(f"  {f.stem}"))
+        if files and self.current_macro is None:
+            self.list_widget.setCurrentRow(0)
+            self.current_macro = files[0].stem
+
+    def _on_macro_select(self):
+        it = self.list_widget.currentItem()
+        self.current_macro = it.text().strip() if it else None
+
+    def get_selected_name(self):
+        it = self.list_widget.currentItem()
+        return it.text().strip() if it else None
+
+    def delete_macro(self):
+        name = self.get_selected_name()
+        if not name:
+            self.log("Ничего не выбрано")
+            return
+        try:
+            (MACROS_DIR / f"{name}.json").unlink()
+            self.log(f"Удалён: {name}")
+            self.current_macro = None
+            self.refresh_macro_list()
+        except Exception as e:
+            self.log(f"⚠ Не удалось удалить: {e}")
+
+    def rename_macro(self):
+        name = self.get_selected_name()
+        if not name:
+            self.log("Ничего не выбрано")
+            return
+        dlg = NeonInputDialog(self, "Переименование", "Новое имя:", name)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        new_name = "".join(c for c in dlg.get_value()
+                           if c.isalnum() or c in " _-").strip()
+        if not new_name or new_name == name:
+            return
+        try:
+            (MACROS_DIR / f"{name}.json").rename(
+                MACROS_DIR / f"{new_name}.json")
+            self.log(f"Переименован: {name} → {new_name}")
+            self.current_macro = None
+            self.refresh_macro_list()
+        except Exception as e:
+            self.log(f"⚠ Ошибка: {e}")
+
+    # ==================== ЗАПИСЬ ====================
+    def toggle_recording(self):
+        if self.recording:
+            self.stop_recording()
+        else:
+            self.start_recording()
+
+    def start_recording(self):
+        if self.recording or self.playing:
+            return
+        self.record_events = []
+        self.recording = True
+        self.stop_flag = False
+        self.record_start = time.time()
+
+        self.rec_btn.setText("⏹  СТОП (запись)")
+        self.rec_btn.setObjectName("PrimaryRec")
+        self.rec_btn.style().unpolish(self.rec_btn)
+        self.rec_btn.style().polish(self.rec_btn)
+
+        self.set_status("ЗАПИСЬ...", RED)
+        self.log("⏺ Запись началась")
+        self.log(f"   Мышь: "
+                 f"{'ВКЛ' if self.settings.get('record_mouse') else 'ВЫКЛ'}")
+
+    def stop_recording(self):
+        if not self.recording:
+            return
+        self.recording = False
+
+        self.rec_btn.setText("⏺  ЗАПИСЬ")
+        self.rec_btn.setObjectName("Primary")
+        self.rec_btn.style().unpolish(self.rec_btn)
+        self.rec_btn.style().polish(self.rec_btn)
+
+        events = self.record_events
+        self.record_events = []
+
+        if not events:
+            self.set_status("ГОТОВ", GREEN)
+            self.log("⏹ Стоп — событий нет")
+            return
+
+        default_name = f"macro_{len(list(MACROS_DIR.glob('*.json'))) + 1}"
+        dlg = NeonInputDialog(
+            self, "Сохранение макроса",
+            f"Имя макроса ({len(events)} событий):", default_name)
+        if dlg.exec_() != QDialog.Accepted:
+            self.set_status("ГОТОВ", GREEN)
+            self.log("⏹ Сохранение отменено")
+            return
+
+        name = "".join(c for c in dlg.get_value()
+                       if c.isalnum() or c in " _-").strip() or default_name
+
+        try:
+            (MACROS_DIR / f"{name}.json").write_text(
+                json.dumps({"name": name, "events": events,
+                            "created": time.time()}, ensure_ascii=False),
+                encoding="utf-8")
+            self.log(f"💾 Сохранён '{name}' — {len(events)} событий")
+            self.current_macro = name
+            self.refresh_macro_list()
+            for i in range(self.list_widget.count()):
+                if self.list_widget.item(i).text().strip() == name:
+                    self.list_widget.setCurrentRow(i)
+                    break
+        except Exception as e:
+            self.log(f"⚠ Ошибка сохранения: {e}")
+        self.set_status("ГОТОВ", GREEN)
+
+    # ==================== ВОСПРОИЗВЕДЕНИЕ ====================
+    def toggle_playback(self):
+        if self.playing:
+            self.stop_flag = True
+            return
+        self.start_playback()
+
+    def start_playback(self):
+        if self.recording or self.playing:
+            return
+        name = self.current_macro or self.get_selected_name()
+        if not name:
+            self.log("Сначала выбери макрос")
+            return
+
+        path = MACROS_DIR / f"{name}.json"
+        if not path.exists():
+            self.log(f"Файл не найден: {path}")
+            return
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            events = data.get("events", [])
+        except Exception as e:
+            self.log(f"⚠ Ошибка чтения: {e}")
+            return
+
+        if not events:
+            self.log("Макрос пустой")
+            return
+
+        try:
+            speed = float(self.speed_edit.text()) or 1.0
+            if speed <= 0:
+                speed = 1.0
+        except ValueError:
+            speed = 1.0
+
+        try:
+            loops = int(self.loops_edit.text())
+        except ValueError:
+            loops = 1
+        if loops == 0:
+            loops = 10 ** 9
+
+        self.playing = True
+        self.stop_flag = False
+
+        self.play_btn.setText("⏹  СТОП")
+        self.play_btn.setObjectName("PrimaryRec")
+        self.play_btn.style().unpolish(self.play_btn)
+        self.play_btn.style().polish(self.play_btn)
+
+        self.set_status("ВОСПРОИЗВЕДЕНИЕ", NEON_BLUE)
+        self.log(f"▶ Старт '{name}' | событий: {len(events)} | "
+                 f"циклов: {'∞' if loops > 10**8 else loops} | x{speed}")
+
+        self.playback_thread = threading.Thread(
+            target=self._playback_worker, args=(events, loops, speed),
+            daemon=True)
+        self.playback_thread.start()
+
+    def _sleep_interruptible(self, seconds):
+        end = time.time() + seconds
+        while time.time() < end:
+            if self.stop_flag:
+                return False
+            time.sleep(min(0.05, max(0, end - time.time())))
+        return True
+
+    def _playback_worker(self, events, loops, speed):
+        kb = KBController()
+        ms = MController()
+        playback_mouse = self.settings.get("playback_mouse", True)
+        random_on = self.settings.get("random_delay_enabled", False)
+        rmin = float(self.settings.get("random_delay_min", 0.0))
+        rmax = float(self.settings.get("random_delay_max", 0.0))
+        loops_disp = "∞" if loops > 10 ** 8 else str(loops)
+
+        for i in range(loops):
+            if self.stop_flag:
+                break
+            self.signals.log.emit(f"  · цикл {i+1}/{loops_disp}")
+            prev_t = 0.0
+            for ev in events:
+                if self.stop_flag:
+                    break
+                dt = (ev["t"] - prev_t) / speed
+                prev_t = ev["t"]
+                if random_on:
+                    dt += random.uniform(rmin, rmax)
+                if dt > 0 and not self._sleep_interruptible(dt):
+                    break
+                t = ev.get("type")
+                try:
+                    if t == "key_press":
+                        kb.press(str_to_key(ev["key"]))
+                    elif t == "key_release":
+                        kb.release(str_to_key(ev["key"]))
+                    elif t == "mouse_click" and playback_mouse:
+                        ms.position = (ev["x"], ev["y"])
+                        bstr = ev.get("button", "Button.left")
+                        if "left" in bstr:
+                            btn = Button.left
+                        elif "right" in bstr:
+                            btn = Button.right
+                        else:
+                            btn = Button.middle
+                        (ms.press if ev.get("pressed") else ms.release)(btn)
+                    elif t == "mouse_move" and playback_mouse:
+                        ms.position = (ev["x"], ev["y"])
+                except Exception as e:
+                    self.signals.log.emit(f"  ⚠ {e}")
+
+        self.signals.playback_done.emit()
+
+    def _on_playback_finished(self):
+        self.playing = False
+        self.stop_flag = False
+        self.play_btn.setText("▶  ВОСПРОИЗВЕСТИ")
+        self.play_btn.setObjectName("Primary")
+        self.play_btn.style().unpolish(self.play_btn)
+        self.play_btn.style().polish(self.play_btn)
+        self.set_status("ГОТОВ", GREEN)
+        self.log("⏹ Воспроизведение завершено")
+
+    # ==================== ХУКИ ====================
+    def _hotkeys(self):
+        return {self.settings.get("hotkey_record"),
+                self.settings.get("hotkey_play"),
+                self.settings.get("hotkey_stop")}
+
+    def _on_key_press(self, key):
+        try:
+            ks = key_to_str(key)
+            hk_rec = self.settings.get("hotkey_record")
+            hk_play = self.settings.get("hotkey_play")
+            hk_stop = self.settings.get("hotkey_stop")
+
+            if not self.capturing:
+                if ks == hk_stop and (self.recording or self.playing):
+                    self.stop_flag = True
+                    QTimer.singleShot(0, self._handle_stop)
+                    return
+                if ks == hk_rec and not self.recording and not self.playing:
+                    QTimer.singleShot(0, self.start_recording)
+                    return
+                if ks == hk_play and not self.recording and not self.playing:
+                    QTimer.singleShot(0, self.start_playback)
+                    return
+
+            if self.recording and ks not in self._hotkeys():
+                self.record_events.append({
+                    "t": time.time() - self.record_start,
+                    "type": "key_press", "key": ks})
+        except Exception:
+            pass
+
+    def _on_key_release(self, key):
+        try:
+            if not self.recording:
+                return
+            ks = key_to_str(key)
+            if ks in self._hotkeys():
+                return
+            self.record_events.append({
+                "t": time.time() - self.record_start,
+                "type": "key_release", "key": ks})
+        except Exception:
+            pass
+
+    def _on_click(self, x, y, button, pressed):
+        try:
+            if not self.recording or not self.settings.get("record_mouse"):
+                return
+            self.record_events.append({
+                "t": time.time() - self.record_start,
+                "type": "mouse_click", "x": x, "y": y,
+                "button": str(button), "pressed": bool(pressed)})
+        except Exception:
+            pass
+
+    def _on_move(self, x, y):
+        try:
+            if not self.recording or not self.settings.get("record_mouse"):
+                return
+            if self.record_events:
+                last = self.record_events[-1]
+                if last.get("type") == "mouse_move":
+                    if abs(last["x"] - x) < 3 and abs(last["y"] - y) < 3:
+                        return
+            self.record_events.append({
+                "t": time.time() - self.record_start,
+                "type": "mouse_move", "x": x, "y": y})
+        except Exception:
+            pass
+
+    def _handle_stop(self):
+        if self.recording:
+            self.stop_recording()
+
+    # ==================== ПРОЧЕЕ ====================
+    def open_settings(self):
+        if self.recording or self.playing:
+            self.log("Сначала останови запись/воспроизведение")
+            return
+        dlg = SettingsDialog(self)
+        dlg.exec_()
+        # на случай изменения фона/яркости
+        self.apply_background()
+
+    def closeEvent(self, event):
+        try:
+            self.stop_flag = True
+            self.kb_listener.stop()
+            self.ms_listener.stop()
+        except Exception:
+            pass
+        save_settings(self.settings)
+        event.accept()
+
+
+if __name__ == "__main__":
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setStyleSheet(QSS)
+
+    win = MacroApp()
+    win.show()
+    sys.exit(app.exec_())
